@@ -1,0 +1,147 @@
+# version: "3.8"
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.8.1-python3.11
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://dengue_admin:dengue_pass_2024@postgres:5432/dengue_db
+    AIRFLOW__CORE__FERNET_KEY: "w9n4vPct4R0LEXus-xdsidMcYRYBXuHGrTzK6b4CpKk="
+    AIRFLOW__WEBSERVER__SECRET_KEY: "dengue-secret-2024"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    PYTHONPATH: /opt/airflow/src
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./src:/opt/airflow/src
+    - ./data:/opt/airflow/data
+    - airflow-logs:/opt/airflow/logs
+  depends_on:
+    postgres:
+      condition: service_healthy
+  networks:
+    - dengue-net
+
+services:
+  # ─── PostgreSQL + PostGIS ───────────────────────────────
+  postgres:
+    image: postgis/postgis:15-3.4
+    container_name: dengue_postgres
+    environment:
+      POSTGRES_USER: dengue_admin
+      POSTGRES_PASSWORD: dengue_pass_2024
+      POSTGRES_DB: dengue_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./init_db.sql:/docker-entrypoint-initdb.d/init_db.sql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "dengue_admin", "-d", "dengue_db"]
+      interval: 10s
+      retries: 5
+    networks:
+      - dengue-net
+
+  # ─── Redis ─────────────────────────────────────────────
+  redis:
+    image: redis:7.2-alpine
+    container_name: dengue_redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      retries: 5
+    networks:
+      - dengue-net
+
+  # ─── MLflow ────────────────────────────────────────────
+  mlflow:
+    image: python:3.11-slim
+    container_name: dengue_mlflow
+    command: bash -c "pip install mlflow==2.10.2 psycopg2-binary==2.9.9 --quiet && mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri postgresql+psycopg2://dengue_admin:dengue_pass_2024@postgres:5432/mlflow_db --default-artifact-root /mlflow/artifacts"
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow-artifacts:/mlflow/artifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - dengue-net
+
+  # ─── Airflow Init ──────────────────────────────────────
+  airflow-init:
+    <<: *airflow-common
+    container_name: dengue_airflow_init
+    command: bash -c "airflow db migrate && airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@dengue.bd"
+    restart: "no"
+
+  # ─── Airflow Webserver ─────────────────────────────────
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: dengue_airflow_webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    restart: always
+
+  # ─── Airflow Scheduler ─────────────────────────────────
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: dengue_airflow_scheduler
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    restart: always
+
+  # ─── FastAPI ───────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: dengue_api
+    ports:
+      - "8000:8000"
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./src/api:/app
+    networks:
+      - dengue-net
+
+  # ─── Streamlit Dashboard ───────────────────────────────
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    container_name: dengue_dashboard
+    ports:
+      - "8501:8501"
+    environment:
+      API_URL: http://api:8000
+    depends_on:
+      - api
+    volumes:
+      - ./dashboard:/app
+    networks:
+      - dengue-net
+
+volumes:
+  postgres-data:
+  airflow-logs:
+  mlflow-artifacts:
+
+networks:
+  dengue-net:
+    driver: bridge

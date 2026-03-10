@@ -1,0 +1,54 @@
+# Environment
+.env
+*.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+
+# Data (never commit raw data)
+data/raw/
+data/intermediate/
+data/processed/
+*.csv
+*.parquet
+*.nc
+*.tif
+*.geojson
+
+# MLflow
+mlflow/mlruns/
+mlruns/
+
+# DVC
+.dvc/tmp/
+.dvc/cache/
+
+# Docker
+docker-data/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp

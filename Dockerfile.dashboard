@@ -1,0 +1,8 @@
+FROM python:3.10-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install streamlit folium streamlit-folium plotly \
+    pandas requests python-dotenv --no-cache-dir
+
+COPY dashboard/ .
+CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]

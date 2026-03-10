@@ -1,0 +1,47 @@
+# Data
+pandas==2.2.0
+numpy==1.26.4
+geopandas==0.14.3
+rasterio==1.3.9
+shapely==2.0.3
+pyproj==3.6.1
+fiona==1.9.5
+
+# ML
+scikit-learn==1.4.0
+xgboost==2.0.3
+lightgbm==4.3.0
+shap==0.44.1
+
+# MLflow
+mlflow==2.10.2
+
+# API
+fastapi==0.109.2
+uvicorn==0.27.1
+redis==5.0.1
+
+# Dashboard
+streamlit==1.31.1
+folium==0.16.0
+streamlit-folium==0.18.0
+plotly==5.19.0
+
+# Monitoring
+evidently==0.4.16
+
+# DB
+psycopg2-binary==2.9.9
+sqlalchemy==2.0.27
+
+# Airflow (install separately - see note)
+# apache-airflow==2.8.1
+
+# Utils
+python-dotenv==1.0.1
+pydantic==2.6.1
+httpx==0.26.0
+pytest==8.0.1
+ruff==0.2.1
+dvc==3.38.1
+cdsapi==0.6.1
