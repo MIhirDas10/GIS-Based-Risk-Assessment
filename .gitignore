@@ -1,6 +1,7 @@
 # Environment
 .env
 *.env
+gdb
 
 # Python
 __pycache__/
