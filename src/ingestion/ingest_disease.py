@@ -91,6 +91,7 @@ def parse_date(date_str):
     week = date.isocalendar()[1]
     return date.year, date.month, week
 
+
 def load_csv(file_path):
     records = []
     with open(file_path, newline="", encoding="utf-8") as f:
