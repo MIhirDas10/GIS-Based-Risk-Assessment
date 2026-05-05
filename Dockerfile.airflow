@@ -1,0 +1,9 @@
+FROM apache/airflow:2.8.1-python3.11
+USER root
+RUN apt-get update && apt-get install -y \
+    libgdal-dev \
+    gdal-bin \
+    libgeos-dev \
+    && rm -rf /var/lib/apt/lists/*
+USER airflow
+RUN pip install geopandas==0.14.3 shapely==2.0.3 pyproj==3.6.1 fiona==1.9.5 psycopg2-binary==2.9.9 --no-cache-dir

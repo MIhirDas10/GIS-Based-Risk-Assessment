@@ -1,55 +1,80 @@
-# Environment
-.env
+# Secrets and machine-local config
+/.env
+/.env.*
 *.env
-gdb
+/.cdsapirc
+/.python-version
+/.streamlit/secrets.toml
 
-# Python
+# Local Python environments
+/.venv/
+/venv/
+/env/
+/ENV/
+/gdb/
+
+# Python bytecode and caches
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
 *.pyd
-.Python
-*.egg-info/
-dist/
-build/
+*.so
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
+.pyre/
+.hypothesis/
+.tox/
+.nox/
 
-# Data (never commit raw data)
-data/raw/
-data/intermediate/
-data/processed/
-*.csv
-*.parquet
-*.nc
-*.tif
-*.geojson
+# Coverage and test output
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
 
-# MLflow
-mlflow/mlruns/
-mlruns/
+# Build artifacts
+build/
+dist/
+site/
+.eggs/
+*.egg
+*.egg-info/
+pip-wheel-metadata/
 
-# DVC
-.dvc/tmp/
-.dvc/cache/
-
-# Docker
-docker-data/
-
-# Jupyter
+# Notebook checkpoints
 .ipynb_checkpoints/
-*.ipynb
 
-# OS
+# Project-generated data and artifacts
+/data/raw/
+/data/intermediate/
+/data/processed/
+/mlruns/
+/mlflow/mlruns/
+/mlflow-artifacts/
+
+# DVC local cache
+/.dvc/cache/
+/.dvc/tmp/
+
+# Runtime state and logs
+*.log
+*.out
+*.err
+*.pid
+*.pid.lock
+/logs/
+/docker-data/
+/postgres-data/
+/airflow/logs/
+
+# IDE and editor files
+/.vscode/
+/.idea/
+*.swp
+*.swo
+*~
+
+# Operating system files
 .DS_Store
 Thumbs.db
 desktop.ini
-
-# Logs
-*.log
-logs/
-
-# IDE
-.vscode/
-.idea/
-*.swp
