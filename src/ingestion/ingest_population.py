@@ -21,18 +21,17 @@ Usage (via Airflow):
 import argparse
 import logging
 import os
-import sys
-import tempfile
 import urllib.request
 from pathlib import Path
 
 import geopandas as gpd
 import numpy as np
-import psycopg2
-from psycopg2.extras import execute_values
 import rasterio
+from psycopg2.extras import execute_values
 from rasterio.mask import mask as rasterio_mask
 from shapely.geometry import mapping
+
+from db import get_db_conn  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -50,8 +49,10 @@ log = logging.getLogger("ingest_population")
 # WorldPop direct download URLs for Bangladesh (unconstrained, 1km aggregated)
 # Using 2020 as the reference year — most complete dataset for Bangladesh
 WORLDPOP_URLS = {
-    2015: "https://data.worldpop.org/GIS/Population/Global_2000_2020_1km_UNadj/2015/BGD/bgd_ppp_2015_1km_Aggregated.tif",
-    2020: "https://data.worldpop.org/GIS/Population/Global_2000_2020_1km_UNadj/2020/BGD/bgd_ppp_2020_1km_Aggregated.tif",
+    # WorldPop reorganized their bucket: the "_UNadj" path 404s; the 1km
+    # Aggregated rasters live under Global_2000_2020_1km/ (without UNadj).
+    2015: "https://data.worldpop.org/GIS/Population/Global_2000_2020_1km/2015/BGD/bgd_ppp_2015_1km_Aggregated.tif",
+    2020: "https://data.worldpop.org/GIS/Population/Global_2000_2020_1km/2020/BGD/bgd_ppp_2020_1km_Aggregated.tif",
 }
 
 # Default year to use
@@ -72,17 +73,6 @@ POPULATION_TIF_PATH = os.getenv(
 # ---------------------------------------------------------------------------
 # Database helpers
 # ---------------------------------------------------------------------------
-
-def get_db_conn():
-    """Return a psycopg2 connection using env vars."""
-    return psycopg2.connect(
-        host=os.getenv("POSTGRES_HOST", "localhost"),
-        port=int(os.getenv("POSTGRES_PORT", 5432)),
-        dbname=os.getenv("POSTGRES_DB", "dengue_db"),
-        user=os.getenv("POSTGRES_USER", "dengue_admin"),
-        password=os.getenv("POSTGRES_PASSWORD", "dengue_pass_2024"),
-    )
-
 
 def get_district_map(conn) -> dict[str, int]:
     """Returns {district_name_lower: district_id} from geo.districts."""
@@ -209,7 +199,7 @@ def compute_district_populations(
         pixel_area_km2 = pixel_width_deg * 102 * pixel_height_deg * 111
 
     records = []
-    for idx, row in districts_gdf.iterrows():
+    for _idx, row in districts_gdf.iterrows():
         dname = row["district_name"]
         geom  = row["geometry"]
         area_km2 = row.get("area_km2", None)
@@ -218,10 +208,7 @@ def compute_district_populations(
         total_pop = stats["total_population"]
 
         # Compute density using actual district area
-        if area_km2 and area_km2 > 0:
-            density = round(total_pop / area_km2, 2)
-        else:
-            density = None
+        density = round(total_pop / area_km2, 2) if area_km2 and area_km2 > 0 else None
 
         log.info(
             "  %-20s  pop=%8d  area=%7.1f km²  density=%6.1f /km²",
@@ -314,7 +301,7 @@ def run(year: int = DEFAULT_YEAR):
     districts_gdf = gpd.read_file(BOUNDARIES_SHP).to_crs("EPSG:4326")
 
     # Normalise name column
-    name_candidates = ["ADM2_EN", "NAME_2", "DIST_NAME", "district", "name"]
+    name_candidates = ["adm2_name", "ADM2_EN", "NAME_2", "DIST_NAME", "district", "name"]
     name_col = next((c for c in name_candidates if c in districts_gdf.columns), None)
     if name_col is None:
         raise ValueError(

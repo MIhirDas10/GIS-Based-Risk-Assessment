@@ -1,0 +1,48 @@
+[tool.ruff]
+# Match the Python version in Dockerfile.airflow
+target-version = "py311"
+line-length = 100
+exclude = [
+    ".venv",
+    "__pycache__",
+    "data",
+    "mlflow",
+    "airflow/logs",
+]
+
+[tool.ruff.lint]
+# Sensible default set: pyflakes, pycodestyle, isort, bugbear, comprehensions, simplify
+select = ["E", "F", "W", "I", "B", "C4", "SIM", "UP"]
+ignore = [
+    "E501",   # line length — soft cap, comments often longer
+    "B008",   # function calls in argument defaults (pytest fixtures use this)
+]
+
+[tool.ruff.lint.isort]
+# These are imported as top-level modules because src/ is on PYTHONPATH inside
+# the containers. Without stating it, ruff infers first-party status from the
+# working directory, so the same file sorts differently when linted from the
+# repo root versus elsewhere, and the "fix" oscillates between two states.
+known-first-party = ["db", "api", "ingestion", "features", "models", "dashboard"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402"]   # late imports allowed in test files
+"scripts/*" = ["E402"]
+# These modules deliberately interleave statements with imports, which isort
+# cannot model: matplotlib.use("Agg") has to run before matplotlib.pyplot is
+# imported, and sys.path.insert has to run before the first-party db import
+# resolves. Sorting them conventionally breaks them at runtime, and ruff's
+# own resolution of the split blocks varies with the working directory.
+"src/api/main.py" = ["I001"]
+"src/models/train.py" = ["I001"]
+"src/models/predict.py" = ["I001"]
+# Plotly and Folium take their layout/style config as keyword arguments, and
+# dict(...) is the idiomatic form throughout their own documentation. Rewriting
+# these as literals hurts readability without buying anything.
+"dashboard/*" = ["C408"]
+
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: requires the live Docker stack (Postgres, Redis, MLflow, API)",
+]

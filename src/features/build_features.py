@@ -44,10 +44,9 @@ import argparse
 import csv
 import logging
 import os
-import sys
 from pathlib import Path
 
-import psycopg2
+from db import get_db_conn  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -63,19 +62,6 @@ log = logging.getLogger("build_features")
 # ---------------------------------------------------------------------------
 EXPORT_DIR = os.getenv("FEATURES_EXPORT_DIR", "/opt/airflow/data/processed")
 EXPORT_FILENAME = "features_mart.csv"
-
-# ---------------------------------------------------------------------------
-# Database connection
-# ---------------------------------------------------------------------------
-
-def get_db_conn():
-    return psycopg2.connect(
-        host=os.getenv("POSTGRES_HOST", "localhost"),
-        port=int(os.getenv("POSTGRES_PORT", 5432)),
-        dbname=os.getenv("POSTGRES_DB", "dengue_db"),
-        user=os.getenv("POSTGRES_USER", "dengue_admin"),
-        password=os.getenv("POSTGRES_PASSWORD", "dengue_pass_2024"),
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -224,12 +210,27 @@ WITH
 -- data — missing population just means density=0, which the
 -- model can still learn from.
 -- ---------------------------------------------------------------
+-- Weeks that cross a month boundary appear twice in disease.dengue_cases
+-- (one row per (district, year, month, week)). Aggregate to one row per
+-- (district, year, week) so the mart's PRIMARY KEY doesn't conflict.
+cases_weekly AS (
+    SELECT
+        district_id,
+        year,
+        week,
+        MIN(month)             AS month,    -- first month the week touched
+        SUM(dengue_cases)      AS dengue_cases,
+        AVG(cases_per_100k)    AS cases_per_100k
+    FROM disease.dengue_cases
+    GROUP BY district_id, year, week
+),
+
 base AS (
     SELECT
-        dc.district_id,
-        dc.year,
-        dc.week,
-        dc.month,
+        cw.district_id,
+        cw.year,
+        cw.week,
+        cw.month,
 
         -- Weather (direct pass-through)
         w.temp_mean_c,
@@ -241,20 +242,20 @@ base AS (
         COALESCE(dp.population_density, 0) AS population_density,
 
         -- Target
-        dc.dengue_cases,
-        dc.cases_per_100k
+        cw.dengue_cases,
+        cw.cases_per_100k
 
-    FROM disease.dengue_cases dc
+    FROM cases_weekly cw
 
     -- Only rows where ERA5 weather exists
     INNER JOIN weather.era5_district_weekly w
-        ON w.district_id = dc.district_id
-        AND w.year       = dc.year
-        AND w.week       = dc.week
+        ON w.district_id = cw.district_id
+        AND w.year       = cw.year
+        AND w.week       = cw.week
 
     -- Population is optional (static)
     LEFT JOIN geo.district_population dp
-        ON dp.district_id = dc.district_id
+        ON dp.district_id = cw.district_id
         AND dp.year       = 2020
 ),
 
@@ -365,17 +366,17 @@ spatial_lag AS (
         e.district_id,
         e.year,
         e.week,
-        AVG(dc_n.dengue_cases) AS cases_spatial_lag
+        AVG(cw_n.dengue_cases) AS cases_spatial_lag
     FROM enriched e
     INNER JOIN geo.districts self_d
         ON self_d.district_id = e.district_id
     INNER JOIN geo.districts neighbour_d
         ON ST_Touches(self_d.geometry, neighbour_d.geometry)
         AND neighbour_d.district_id != e.district_id
-    INNER JOIN disease.dengue_cases dc_n
-        ON dc_n.district_id = neighbour_d.district_id
-        AND dc_n.year       = e.year
-        AND dc_n.week       = e.week
+    INNER JOIN cases_weekly cw_n
+        ON cw_n.district_id = neighbour_d.district_id
+        AND cw_n.year       = e.year
+        AND cw_n.week       = e.week
     GROUP BY e.district_id, e.year, e.week
 ),
 
@@ -659,7 +660,7 @@ def run(export: bool = False):
             cur.execute(VALIDATION_SQL)
             val = cur.fetchone()
             cols = [desc[0] for desc in cur.description]
-            result = dict(zip(cols, val))
+            result = dict(zip(cols, val, strict=True))
 
         log.info("-" * 50)
         log.info("VALIDATION RESULTS")
@@ -740,6 +741,282 @@ def run_export_only():
         conn.close()
 
 
+# ===========================================================================
+# Forecast mart — for serving predictions on weeks WITHOUT recent disease
+# ground truth (i.e. anything past 2023-W52 in our current data set).
+# ===========================================================================
+#
+# The training mart INNER JOINs disease.dengue_cases, so it can only cover
+# weeks where we have actual case data. Once we want to predict for, say,
+# 2026-W08 (we have weather for it, but no dengue ground truth), the training
+# mart goes dark. This builder produces a parallel features.forecast_mart
+# that:
+#   - Uses real ERA5 weather for all current-week, lag, rolling, interaction
+#     features (same definitions as the training mart)
+#   - Uses LAST YEAR's same-week dengue_cases for `cases_spatial_lag` (a
+#     reasonable stand-in — climatology repeats and the model's already
+#     trained to interpret this signal)
+#   - Leaves `dengue_cases` / `cases_per_100k` as NULL (the target we'd
+#     normally train on; predict.py doesn't need it)
+#
+# The serving model is the same Production XGBoost from training; we just
+# point predict.py at this table instead.
+
+DDL_FORECAST_MART = """
+CREATE TABLE IF NOT EXISTS features.forecast_mart (
+    district_id         INTEGER  NOT NULL REFERENCES geo.districts(district_id),
+    year                INTEGER  NOT NULL,
+    week                INTEGER  NOT NULL,
+
+    temp_mean_c         FLOAT,
+    temp_max_c          FLOAT,
+    rainfall_mm         FLOAT,
+    humidity_pct        FLOAT,
+
+    rainfall_lag_2w     FLOAT,
+    rainfall_lag_4w     FLOAT,
+    temp_lag_2w         FLOAT,
+    humidity_lag_2w     FLOAT,
+
+    temp_rolling_4w     FLOAT,
+    rainfall_rolling_4w FLOAT,
+
+    humidity_x_temp     FLOAT,
+    rainfall_x_density  FLOAT,
+
+    cases_spatial_lag   FLOAT,   -- stand-in: same week, last year (or 0)
+
+    week_sin            FLOAT,
+    week_cos            FLOAT,
+    month               INTEGER,
+
+    population_density  FLOAT,
+    hotspot_rank        FLOAT,
+
+    -- Targets are NULL for forecast rows (we don't know them yet)
+    dengue_cases        INTEGER,
+    cases_per_100k      FLOAT,
+
+    PRIMARY KEY (district_id, year, week)
+);
+"""
+
+DDL_FORECAST_INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_forecast_mart_year
+    ON features.forecast_mart (year);
+CREATE INDEX IF NOT EXISTS idx_forecast_mart_district
+    ON features.forecast_mart (district_id);
+CREATE INDEX IF NOT EXISTS idx_forecast_mart_district_year_week
+    ON features.forecast_mart (district_id, year, week);
+"""
+
+# The CTE pipeline is the same as the training mart's, with two differences:
+#   1. The base CTE INNER JOINs only on weather (not disease), so we get
+#      a row for every (district, year, week) where ERA5 exists.
+#   2. spatial_lag uses last year's same-week dengue_cases as a stand-in
+#      (LEFT JOIN, defaults to 0 if no prior year).
+FORECAST_FEATURE_SQL = """
+INSERT INTO features.forecast_mart (
+    district_id, year, week,
+    temp_mean_c, temp_max_c, rainfall_mm, humidity_pct,
+    rainfall_lag_2w, rainfall_lag_4w, temp_lag_2w, humidity_lag_2w,
+    temp_rolling_4w, rainfall_rolling_4w,
+    humidity_x_temp, rainfall_x_density,
+    cases_spatial_lag,
+    week_sin, week_cos, month,
+    population_density,
+    hotspot_rank,
+    dengue_cases, cases_per_100k
+)
+
+WITH
+
+base AS (
+    -- Every (district, year, week) where ERA5 weather exists.
+    -- We join geo.districts so districts without ERA5 (none, in our case)
+    -- are dropped naturally.
+    SELECT
+        w.district_id,
+        w.year,
+        w.week,
+        -- Derive month from ISO year+week: approximate, since week 1 can
+        -- span December and January. Close enough for the model.
+        ((w.week - 1) * 12 / 52 + 1)::INT AS month,
+
+        w.temp_mean_c,
+        w.temp_max_c,
+        w.rainfall_mm,
+        w.humidity_pct,
+
+        COALESCE(dp.population_density, 0) AS population_density
+
+    FROM weather.era5_district_weekly w
+    INNER JOIN geo.districts d
+        ON d.district_id = w.district_id
+    LEFT JOIN geo.district_population dp
+        ON dp.district_id = w.district_id
+        AND dp.year       = 2020
+),
+
+lag_features AS (
+    -- Identical window logic to the training mart.
+    SELECT
+        *,
+        LAG(rainfall_mm, 2) OVER w_district AS rainfall_lag_2w,
+        LAG(rainfall_mm, 4) OVER w_district AS rainfall_lag_4w,
+        LAG(temp_mean_c, 2) OVER w_district AS temp_lag_2w,
+        LAG(humidity_pct, 2) OVER w_district AS humidity_lag_2w,
+        AVG(temp_mean_c) OVER (
+            PARTITION BY district_id ORDER BY year, week
+            ROWS BETWEEN 3 PRECEDING AND CURRENT ROW
+        ) AS temp_rolling_4w,
+        SUM(rainfall_mm) OVER (
+            PARTITION BY district_id ORDER BY year, week
+            ROWS BETWEEN 3 PRECEDING AND CURRENT ROW
+        ) AS rainfall_rolling_4w
+    FROM base
+    WINDOW w_district AS (PARTITION BY district_id ORDER BY year, week)
+),
+
+enriched AS (
+    SELECT
+        *,
+        humidity_pct * temp_mean_c AS humidity_x_temp,
+        rainfall_mm * population_density AS rainfall_x_density,
+        SIN(2 * PI() * week / 52.0) AS week_sin,
+        COS(2 * PI() * week / 52.0) AS week_cos
+    FROM lag_features
+),
+
+-- Spatial lag stand-in: mean dengue_cases in neighbouring districts for the
+-- SAME week of the PREVIOUS YEAR. Captures climatology of nearby outbreaks
+-- without needing this week's ground truth.
+spatial_lag AS (
+    SELECT
+        e.district_id,
+        e.year,
+        e.week,
+        AVG(dc_n.dengue_cases) AS cases_spatial_lag
+    FROM enriched e
+    INNER JOIN geo.districts self_d
+        ON self_d.district_id = e.district_id
+    INNER JOIN geo.districts neighbour_d
+        ON ST_Touches(self_d.geometry, neighbour_d.geometry)
+        AND neighbour_d.district_id != e.district_id
+    INNER JOIN disease.dengue_cases dc_n
+        ON dc_n.district_id = neighbour_d.district_id
+        AND dc_n.year       = e.year - 1
+        AND dc_n.week       = e.week
+    GROUP BY e.district_id, e.year, e.week
+),
+
+hotspot AS (
+    SELECT
+        district_id,
+        PERCENT_RANK() OVER (ORDER BY AVG(dengue_cases)) AS hotspot_rank
+    FROM disease.dengue_cases
+    GROUP BY district_id
+)
+
+SELECT
+    e.district_id, e.year, e.week,
+    e.temp_mean_c, e.temp_max_c, e.rainfall_mm, e.humidity_pct,
+    e.rainfall_lag_2w, e.rainfall_lag_4w, e.temp_lag_2w, e.humidity_lag_2w,
+    e.temp_rolling_4w, e.rainfall_rolling_4w,
+    e.humidity_x_temp, e.rainfall_x_density,
+    COALESCE(sl.cases_spatial_lag, 0) AS cases_spatial_lag,
+    e.week_sin, e.week_cos, e.month,
+    e.population_density,
+    COALESCE(h.hotspot_rank, 0) AS hotspot_rank,
+    NULL::INTEGER  AS dengue_cases,   -- target unknown for forecast rows
+    NULL::FLOAT    AS cases_per_100k
+FROM enriched e
+LEFT JOIN spatial_lag sl
+    ON sl.district_id = e.district_id
+    AND sl.year       = e.year
+    AND sl.week       = e.week
+LEFT JOIN hotspot h
+    ON h.district_id = e.district_id
+
+ON CONFLICT (district_id, year, week) DO UPDATE SET
+    temp_mean_c         = EXCLUDED.temp_mean_c,
+    temp_max_c          = EXCLUDED.temp_max_c,
+    rainfall_mm         = EXCLUDED.rainfall_mm,
+    humidity_pct        = EXCLUDED.humidity_pct,
+    rainfall_lag_2w     = EXCLUDED.rainfall_lag_2w,
+    rainfall_lag_4w     = EXCLUDED.rainfall_lag_4w,
+    temp_lag_2w         = EXCLUDED.temp_lag_2w,
+    humidity_lag_2w     = EXCLUDED.humidity_lag_2w,
+    temp_rolling_4w     = EXCLUDED.temp_rolling_4w,
+    rainfall_rolling_4w = EXCLUDED.rainfall_rolling_4w,
+    humidity_x_temp     = EXCLUDED.humidity_x_temp,
+    rainfall_x_density  = EXCLUDED.rainfall_x_density,
+    cases_spatial_lag   = EXCLUDED.cases_spatial_lag,
+    week_sin            = EXCLUDED.week_sin,
+    week_cos            = EXCLUDED.week_cos,
+    month               = EXCLUDED.month,
+    population_density  = EXCLUDED.population_density,
+    hotspot_rank        = EXCLUDED.hotspot_rank;
+"""
+
+
+def build_forecast_mart() -> int:
+    """
+    Build features.forecast_mart — feature rows for every (district, year,
+    week) where ERA5 weather exists, including weeks that have no dengue
+    ground truth yet. Returns row count.
+    """
+    log.info("=" * 60)
+    log.info("FORECAST MART BUILD — STARTING")
+    log.info("=" * 60)
+
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            log.info("Ensuring features.forecast_mart table exists ...")
+            cur.execute(DDL_FORECAST_MART)
+            conn.commit()
+
+            log.info("Truncating features.forecast_mart for full rebuild ...")
+            cur.execute("TRUNCATE TABLE features.forecast_mart;")
+            conn.commit()
+
+            log.info("Building forecast mart from ERA5 + historical patterns ...")
+            cur.execute(FORECAST_FEATURE_SQL)
+            rows = cur.rowcount
+            conn.commit()
+            log.info("  -> Inserted %d rows", rows)
+
+            for stmt in DDL_FORECAST_INDEXES.split(";"):
+                stmt = stmt.strip()
+                if stmt:
+                    cur.execute(stmt + ";")
+            conn.commit()
+
+            cur.execute("""
+                SELECT
+                    COUNT(*) AS total_rows,
+                    COUNT(DISTINCT district_id) AS n_districts,
+                    MIN(year) || '-W' || MIN(week) AS first_week,
+                    MAX(year) || '-W' || MAX(week) AS last_week,
+                    SUM(CASE WHEN cases_spatial_lag = 0 THEN 1 ELSE 0 END) AS spatial_lag_zero
+                FROM features.forecast_mart;
+            """)
+            row = cur.fetchone()
+            log.info("  rows=%d districts=%d span=%s..%s spatial_lag_zero=%d",
+                     row[0], row[1], row[2], row[3], row[4])
+
+        log.info("=" * 60)
+        log.info("FORECAST MART BUILD — COMPLETE")
+        log.info("=" * 60)
+        return rows
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Build the ML feature mart")
     parser.add_argument(
@@ -750,9 +1027,15 @@ if __name__ == "__main__":
         "--export-only", action="store_true",
         help="Skip build, just export existing mart to CSV",
     )
+    parser.add_argument(
+        "--forecast", action="store_true",
+        help="Build features.forecast_mart (current + future weeks for serving)",
+    )
     args = parser.parse_args()
 
     if args.export_only:
         run_export_only()
+    elif args.forecast:
+        build_forecast_mart()
     else:
         run(export=args.export)
