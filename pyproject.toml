@@ -28,6 +28,14 @@ known-first-party = ["db", "api", "ingestion", "features", "models", "dashboard"
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["E402"]   # late imports allowed in test files
 "scripts/*" = ["E402"]
+# These modules deliberately interleave statements with imports, which isort
+# cannot model: matplotlib.use("Agg") has to run before matplotlib.pyplot is
+# imported, and sys.path.insert has to run before the first-party db import
+# resolves. Sorting them conventionally breaks them at runtime, and ruff's
+# own resolution of the split blocks varies with the working directory.
+"src/api/main.py" = ["I001"]
+"src/models/train.py" = ["I001"]
+"src/models/predict.py" = ["I001"]
 # Plotly and Folium take their layout/style config as keyword arguments, and
 # dict(...) is the idiomatic form throughout their own documentation. Rewriting
 # these as literals hurts readability without buying anything.
