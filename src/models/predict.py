@@ -46,11 +46,11 @@ from pathlib import Path
 import matplotlib
 
 matplotlib.use("Agg")
+import mlflow
 import numpy as np
 import pandas as pd
 from psycopg2.extras import execute_values
 
-import mlflow
 from db import get_db_conn, get_sqlalchemy_engine  # noqa: E402
 
 # ---------------------------------------------------------------------------
