@@ -1,0 +1,29 @@
+[tool.ruff]
+# Match the Python version in Dockerfile.airflow
+target-version = "py311"
+line-length = 100
+exclude = [
+    ".venv",
+    "__pycache__",
+    "data",
+    "mlflow",
+    "airflow/logs",
+]
+
+[tool.ruff.lint]
+# Sensible default set: pyflakes, pycodestyle, isort, bugbear, comprehensions, simplify
+select = ["E", "F", "W", "I", "B", "C4", "SIM", "UP"]
+ignore = [
+    "E501",   # line length — soft cap, comments often longer
+    "B008",   # function calls in argument defaults (pytest fixtures use this)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402"]   # late imports allowed in test files
+"scripts/*" = ["E402"]
+
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: requires the live Docker stack (Postgres, Redis, MLflow, API)",
+]
