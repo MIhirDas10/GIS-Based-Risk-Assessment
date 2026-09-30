@@ -1,9 +1,11 @@
-import os
 import csv
 import logging
+import os
 from datetime import datetime
-import psycopg2  # importing postgresql library -> connect and query db
+
 from psycopg2.extras import execute_values  # faster for bulk inserts
+
+from db import get_db_conn as get_conn  # noqa: E402  (alias for legacy callsites)
 
 logging.basicConfig(level=logging.INFO)  # records msg
 logger = logging.getLogger(__name__)
@@ -27,18 +29,8 @@ DIST_DIVISION = {
     "Barisal": "Barisal",
     "Sylhet": "Sylhet",
     "Mymensingh": "Mymensingh",
-    "Rajshahi": "Rajshahi", 
+    "Rajshahi": "Rajshahi",
 }
-
-def get_conn():
-    return psycopg2.connect(
-        host=os.getenv("POSTGRES_HOST", "postgres"),
-        port=os.getenv("POSTGRES_PORT", 5432),
-        dbname=os.getenv("POSTGRES_DB", "dengue_db"),
-        user=os.getenv("POSTGRES_USER", "dengue_admin"),
-        password=os.getenv("POSTGRES_PASSWORD", "dengue_pass_2024"),
-    )
-
 
 def ensure_dist_exists(conn):
     # insert dist if geo.dist not there
@@ -109,7 +101,12 @@ def load_csv(file_path):
 
 
 def prepare_case_rows(records, dist_id_map):
-    case_rows = []
+    # CSV ships daily counts; the schema is one row per (district, year,
+    # month, week). Sum the daily values up to weekly before inserting,
+    # otherwise the UNIQUE(district_id, year, month, week) constraint
+    # rejects the 2nd–5th day of each week.
+    from collections import defaultdict
+    weekly = defaultdict(int)
     missing_districts = set()
 
     for dist_name, year, month, week, patients in records:
@@ -117,8 +114,9 @@ def prepare_case_rows(records, dist_id_map):
         if not dist_id:
             missing_districts.add(dist_name)
             continue
+        weekly[(dist_id, year, month, week)] += patients
 
-        case_rows.append((dist_id, year, month, week, patients, "kaggle"))
+    case_rows = [(d, y, m, w, p, "kaggle") for (d, y, m, w), p in weekly.items()]
 
     if missing_districts:
         logger.warning(
@@ -126,6 +124,9 @@ def prepare_case_rows(records, dist_id_map):
             ", ".join(sorted(missing_districts)),
         )
 
+    logger.info(
+        "Aggregated %d daily records into %d weekly rows", len(records), len(case_rows)
+    )
     return case_rows
 
 
@@ -137,37 +138,12 @@ def insert_cases(conn, case_rows):
     cursor = conn.cursor()
     insert_sql = """
         INSERT INTO disease.dengue_cases (
-            district_id,
-            year,
-            month,
-            week,
-            dengue_cases,
-            data_source
+            district_id, year, month, week, dengue_cases, data_source
         )
-        SELECT
-            v.district_id,
-            v.year,
-            v.month,
-            v.week,
-            v.dengue_cases,
-            v.data_source
-        FROM (VALUES %s) AS v(
-            district_id,
-            year,
-            month,
-            week,
-            dengue_cases,
-            data_source
-        )
-        WHERE NOT EXISTS (
-            SELECT 1
-            FROM disease.dengue_cases d
-            WHERE d.district_id = v.district_id
-              AND d.year = v.year
-              AND d.month = v.month
-              AND d.week = v.week
-              AND d.dengue_cases = v.dengue_cases
-        )
+        VALUES %s
+        ON CONFLICT (district_id, year, month, week) DO UPDATE
+        SET dengue_cases = EXCLUDED.dengue_cases,
+            ingested_at  = NOW()
     """
 
     execute_values(

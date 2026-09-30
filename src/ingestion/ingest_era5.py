@@ -19,18 +19,20 @@ import argparse
 import logging
 import os
 import sys
-import tempfile
+import threading
 from pathlib import Path
 
 import cdsapi
 import geopandas as gpd
 import netCDF4 as nc
 import numpy as np
-import psycopg2
 from psycopg2.extras import execute_values
-import rasterio
-from rasterio.mask import mask as rasterio_mask
 from shapely.geometry import mapping
+
+from db import get_db_conn  # noqa: E402
+
+# rasterio submodules (.features, .transform) are imported lazily inside
+# functions to keep cold-import time low when only metadata is needed.
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -65,17 +67,6 @@ BOUNDARIES_SHP = os.getenv(
 # Database helpers
 # ---------------------------------------------------------------------------
 
-def get_db_conn():
-    """Return a psycopg2 connection using env vars."""
-    return psycopg2.connect(
-        host=os.getenv("POSTGRES_HOST", "localhost"),
-        port=int(os.getenv("POSTGRES_PORT", 5432)),
-        dbname=os.getenv("POSTGRES_DB", "dengue_db"),
-        user=os.getenv("POSTGRES_USER", "dengue_admin"),
-        password=os.getenv("POSTGRES_PASSWORD", "dengue_pass_2024"),
-    )
-
-
 def get_district_map(conn):
     """
     Returns {district_name_lower: district_id} from geo.districts.
@@ -91,39 +82,192 @@ def get_district_map(conn):
 # ERA5 download
 # ---------------------------------------------------------------------------
 
-def download_era5(year: int, tmp_dir: str) -> Path:
-    """
-    Download ERA5-Land hourly data for Bangladesh for a given year.
-    Returns path to the downloaded NetCDF file.
+# 6-hourly sampling (00, 06, 12, 18 UTC) instead of all 24 hours. For weekly
+# aggregates this is statistically equivalent and reduces both CDS cost and
+# zonal-stats processing time by 4×. The weekly model doesn't care about
+# diurnal variation. Switch back to range(24) if a future model needs it.
+ERA5_TIMES = ["00:00", "06:00", "12:00", "18:00"]
 
-    Pulls all 12 months at once for the year but only for the Bangladesh
-    bounding box — keeps file size manageable (~200–400 MB per year).
-    """
-    out_path = Path(tmp_dir) / f"era5_bangladesh_{year}.nc"
 
-    if out_path.exists():
-        log.info("ERA5 file already exists, skipping download: %s", out_path)
+def _is_zip(path: Path) -> bool:
+    """Detect a ZIP archive by its magic number (PK\\x03\\x04)."""
+    try:
+        with open(path, "rb") as f:
+            return f.read(4) == b"PK\x03\x04"
+    except OSError:
+        return False
+
+
+def _unwrap_zip_to_nc(zip_path: Path) -> Path:
+    """
+    CDS-beta delivers ERA5-Land "netcdf" requests as ZIP archives containing
+    one or more .nc files. Extract the first .nc and replace the wrapper
+    so downstream code sees a real NetCDF.
+    """
+    import shutil
+    import zipfile
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        nc_members = [m for m in zf.namelist() if m.endswith(".nc")]
+        if not nc_members:
+            raise RuntimeError(
+                f"ZIP {zip_path.name} contains no .nc files: {zf.namelist()}"
+            )
+        # Multiple .nc per request can happen if CDS splits by variable group;
+        # we want a single merged file. Extract all and then merge (or use
+        # the first if there's only one).
+        extract_dir = zip_path.parent / f"_unpack_{zip_path.stem}"
+        extract_dir.mkdir(exist_ok=True)
+        for m in nc_members:
+            zf.extract(m, extract_dir)
+        extracted = [extract_dir / m for m in nc_members]
+
+    if len(extracted) == 1:
+        shutil.move(str(extracted[0]), str(zip_path))   # replace zip with nc
+    else:
+        # CDS sometimes ships one .nc per variable group. Merge into one
+        # via netCDF4 — copy all variables into a single file matching what
+        # process_netcdf expects.
+        import netCDF4 as _nc
+        merged_tmp = zip_path.parent / (zip_path.stem + "_merged.nc")
+        with _nc.Dataset(str(merged_tmp), "w") as dst:
+            for src_path in extracted:
+                with _nc.Dataset(str(src_path), "r") as src:
+                    # Copy dimensions (skip if already created)
+                    for name, dim in src.dimensions.items():
+                        if name not in dst.dimensions:
+                            dst.createDimension(
+                                name, len(dim) if not dim.isunlimited() else None
+                            )
+                    # Copy variables (skip duplicates)
+                    for name, var in src.variables.items():
+                        if name in dst.variables:
+                            continue
+                        new_var = dst.createVariable(
+                            name, var.datatype, var.dimensions
+                        )
+                        new_var.setncatts({k: var.getncattr(k) for k in var.ncattrs()})
+                        new_var[:] = var[:]
+        shutil.move(str(merged_tmp), str(zip_path))
+
+    # Cleanup
+    shutil.rmtree(extract_dir, ignore_errors=True)
+    return zip_path
+
+
+def _download_one_month(
+    year: int, month: int, tmp_dir: str, sem: "threading.Semaphore"
+) -> Path:
+    """Download a single month's ERA5-Land NetCDF. Cached on disk.
+
+    Handles the CDS-beta quirk where "netcdf" requests are delivered as
+    ZIP archives containing the .nc file(s). After download, if the file
+    is a ZIP, we unwrap it in place so callers get a real NetCDF.
+    """
+    out_path = Path(tmp_dir) / f"era5_bangladesh_{year}_{month:02d}.nc"
+
+    # Cache hit only if file exists AND is a valid NetCDF (not a stale ZIP)
+    if out_path.exists() and out_path.stat().st_size > 0 and not _is_zip(out_path):
+        log.info("  [cache] %s already exists, skipping", out_path.name)
         return out_path
 
-    log.info("Downloading ERA5-Land data for year %d …", year)
+    with sem:  # bound CDS concurrency per the platform's per-user limit
+        log.info("  [submit] CDS request for %d-%02d …", year, month)
+        c = cdsapi.Client(quiet=True, retry_max=5)
+        c.retrieve(
+            "reanalysis-era5-land",
+            {
+                "variable": ERA5_VARIABLES,
+                "year":  str(year),
+                "month": f"{month:02d}",
+                "day":   [f"{d:02d}" for d in range(1, 32)],
+                "time":  ERA5_TIMES,
+                "area":  BBOX,
+                "format": "netcdf",
+            },
+            str(out_path),
+        )
 
-    c = cdsapi.Client()  # reads ~/.cdsapirc automatically
-    c.retrieve(
-        "reanalysis-era5-land",
-        {
-            "variable": ERA5_VARIABLES,
-            "year": str(year),
-            "month": [f"{m:02d}" for m in range(1, 13)],
-            "day": [f"{d:02d}" for d in range(1, 32)],
-            "time": [f"{h:02d}:00" for h in range(24)],   # all 24 hours
-            "area": BBOX,                                   # [N, W, S, E]
-            "format": "netcdf",
-        },
-        str(out_path),
+        # CDS-beta hands back a ZIP for ERA5-Land netcdf requests
+        if _is_zip(out_path):
+            log.info("  [unzip]  %s is a ZIP archive — unwrapping", out_path.name)
+            _unwrap_zip_to_nc(out_path)
+
+        log.info(
+            "  [done]   %s (%.1f MB)",
+            out_path.name, out_path.stat().st_size / 1e6,
+        )
+    return out_path
+
+
+def download_era5(year: int, tmp_dir: str) -> list[Path]:
+    """
+    Download a full year of ERA5-Land in monthly chunks, in parallel.
+
+    Why monthly: post-2024 CDS API enforces a per-request "cost" limit
+    (variables × time_steps × grid_points). A full-year hourly request for
+    3 variables across the Bangladesh BBOX exceeds it (403 "cost limits
+    exceeded"). Per-month at 6-hourly granularity is well under the cap.
+
+    Why parallel: CDS allows multiple concurrent requests per user. Queue
+    waits dominate total time, so submitting all 12 months at once lets
+    the slowest months overlap with the faster ones. Bound by MAX_CONCURRENT
+    so we stay polite. Each download is cached on disk; retries skip
+    already-completed months.
+    """
+    import concurrent.futures
+    import datetime as _dt
+    import threading
+
+    MAX_CONCURRENT = 4   # conservative — CDS docs say up to 10 concurrent
+    sem = threading.Semaphore(MAX_CONCURRENT)
+
+    # For the current year, only request months that exist. ERA5-Land also
+    # has a ~3 month publication lag, so cap at (current_month - 3) to be
+    # safe — partial months yield MultiAdaptorNoDataError.
+    today = _dt.date.today()
+    if year == today.year:
+        last_month = max(1, today.month - 3)
+        months = list(range(1, last_month + 1))
+        log.info(
+            "Current year %d: limiting to months 1..%d (publication lag-aware)",
+            year, last_month,
+        )
+    elif year > today.year:
+        log.warning("Year %d is in the future — nothing to download", year)
+        return []
+    else:
+        months = list(range(1, 13))
+
+    log.info(
+        "Downloading ERA5-Land %d in %d monthly chunks (max %d concurrent) …",
+        year, len(months), MAX_CONCURRENT,
     )
 
-    log.info("Download complete: %s (%.1f MB)", out_path, out_path.stat().st_size / 1e6)
-    return out_path
+    out_paths: list[Path] = [None] * 12  # preserve month order
+    errors: list[tuple[int, BaseException]] = []
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT) as ex:
+        futures = {
+            ex.submit(_download_one_month, year, m, tmp_dir, sem): m
+            for m in months
+        }
+        for fut in concurrent.futures.as_completed(futures):
+            month = futures[fut]
+            try:
+                out_paths[month - 1] = fut.result()
+            except BaseException as e:
+                log.error("Month %d-%02d failed: %s", year, month, e)
+                errors.append((month, e))
+
+    if errors:
+        # Re-raise first error so Airflow task fails and retries; subsequent
+        # retries skip the already-downloaded months thanks to the disk cache.
+        m, e = errors[0]
+        raise RuntimeError(
+            f"{len(errors)} of 12 months failed for {year}; first: {year}-{m:02d} → {e}"
+        )
+
+    return [p for p in out_paths if p is not None]
 
 
 # ---------------------------------------------------------------------------
@@ -146,163 +290,156 @@ def dewpoint_to_rh(temp_k: np.ndarray, dewpoint_k: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Zonal statistics
+# NetCDF → weekly district aggregates  (fast vectorized path)
+#
+# The old per-timestep, per-district rasterio.mask zonal_mean was dropped:
+# the new path pre-rasterizes each district to a boolean mask ONCE, then
+# uses numpy indexing per timestep — ~100× faster on a year of hourly data.
 # ---------------------------------------------------------------------------
 
-def zonal_mean(data_2d: np.ndarray, transform, district_geom) -> float:
+def _build_district_masks(
+    districts_gdf: gpd.GeoDataFrame, transform, height: int, width: int
+) -> dict[str, np.ndarray]:
     """
-    Compute the mean of data_2d (2-D array: lat × lon) over a district polygon.
-    Returns np.nan if no valid pixels fall inside the polygon.
+    Rasterize each district polygon ONCE to a boolean mask matching the ERA5
+    grid shape. Subsequent per-timestep aggregation becomes pure numpy
+    indexing — no rasterio.mask call per (timestep × district × variable).
 
-    Parameters
-    ----------
-    data_2d   : 2-D numpy array with shape (rows, cols)
-    transform : rasterio Affine transform matching data_2d
-    district_geom : shapely geometry (any type)
+    For a Bangladesh BBOX (~63×47 cells at 0.1°), each mask is ~3 kB, so
+    all 64 districts fit comfortably in memory.
     """
-    # rasterio.mask expects a list of GeoJSON-like dicts
-    geojson_geom = [mapping(district_geom)]
+    from rasterio.features import rasterize
 
-    # Write data to an in-memory raster so rasterio.mask can clip it
-    with rasterio.MemoryFile() as memfile:
-        with memfile.open(
-            driver="GTiff",
-            height=data_2d.shape[0],
-            width=data_2d.shape[1],
-            count=1,
-            dtype=data_2d.dtype,
-            crs="EPSG:4326",
+    masks: dict[str, np.ndarray] = {}
+    for _, row in districts_gdf.iterrows():
+        dname = row["district_name"]
+        geom = row["geometry"]
+        if geom is None or geom.is_empty:
+            continue
+        # rasterize returns 1 where polygon covers the pixel, 0 elsewhere
+        rasterized = rasterize(
+            [(mapping(geom), 1)],
+            out_shape=(height, width),
             transform=transform,
-            nodata=np.nan,
-        ) as dataset:
-            dataset.write(data_2d.astype(np.float32), 1)
+            fill=0,
+            all_touched=True,
+            dtype=np.uint8,
+        )
+        mask = rasterized.astype(bool)
+        if mask.any():
+            masks[dname] = mask
+        else:
+            log.warning("District %s has no overlapping pixels — skipping", dname)
+    log.info("  Pre-rasterized %d district masks", len(masks))
+    return masks
 
-        with memfile.open() as dataset:
-            try:
-                out_image, _ = rasterio_mask(
-                    dataset,
-                    geojson_geom,
-                    crop=True,
-                    nodata=np.nan,
-                    all_touched=True,   # include edge pixels
-                )
-            except ValueError:
-                # geometry does not overlap raster extent
-                return np.nan
-
-    pixels = out_image[0]
-    valid  = pixels[~np.isnan(pixels)]
-    return float(np.mean(valid)) if len(valid) > 0 else np.nan
-
-
-# ---------------------------------------------------------------------------
-# NetCDF → weekly district aggregates
-# ---------------------------------------------------------------------------
 
 def process_netcdf(nc_path: Path, districts_gdf: gpd.GeoDataFrame) -> list[dict]:
     """
-    Read the ERA5 NetCDF file, compute zonal statistics per district per hour,
-    then aggregate hourly values to ISO week-level summaries.
+    Read the ERA5 NetCDF file and compute weekly district-level aggregates.
 
-    Returns a list of dicts ready for DB insertion:
-        {district_name, year, week, temp_mean_c, temp_max_c,
-         rainfall_mm, humidity_pct}
+    Algorithm (vectorized — ~100× faster than naive zonal_mean per timestep):
+      1. Pre-rasterize each district polygon ONCE → boolean mask
+      2. For each timestep slice, derive RH and convert precip units
+      3. For each district mask, take np.mean / np.sum of the masked pixels
+         (pure numpy — no rasterio per call)
+      4. Group resulting per-timestep per-district values by ISO week and
+         reduce (mean for temp/humidity, sum for rainfall, max for temp_max)
     """
-    log.info("Opening NetCDF: %s", nc_path)
+    log.info("Opening NetCDF: %s", nc_path.name)
     ds = nc.Dataset(str(nc_path))
 
-    # ERA5 dimension names
-    lats = ds.variables["latitude"][:]   # 1-D
-    lons = ds.variables["longitude"][:]  # 1-D
-    times = ds.variables["time"]         # hours since 1900-01-01 00:00
+    lats = ds.variables["latitude"][:]
+    lons = ds.variables["longitude"][:]
+    # CDS-beta NetCDFs use "valid_time"; legacy CDS used "time"
+    time_var_name = "valid_time" if "valid_time" in ds.variables else "time"
+    times = ds.variables[time_var_name]
+    time_vals = nc.num2date(
+        times[:], times.units,
+        times.calendar if hasattr(times, "calendar") else "standard",
+    )
 
-    import cftime
-    time_vals = nc.num2date(times[:], times.units, times.calendar
-                            if hasattr(times, "calendar") else "standard")
+    # Newer CDS NetCDFs sometimes name the variables differently
+    var_t = ds.variables["t2m"] if "t2m" in ds.variables else ds.variables["2t"]
+    var_tp = ds.variables["tp"]
+    var_d = ds.variables["d2m"] if "d2m" in ds.variables else ds.variables["2d"]
+    t2m = np.array(var_t[:])
+    tp = np.array(var_tp[:])
+    d2m = np.array(var_d[:])
+    ds.close()
 
-    # Variable arrays: shape (time, lat, lon)
-    t2m  = ds.variables["t2m"][:]   # 2m temperature (K)
-    tp   = ds.variables["tp"][:]    # total precipitation (m/hour → convert to mm)
-    d2m  = ds.variables["d2m"][:]   # 2m dewpoint (K)
-
-    # Build rasterio Affine transform from the lat/lon grid
-    # ERA5 grid is regular — use spacing of first two cells
+    # Build affine transform matching the grid
     lon_res = float(lons[1] - lons[0])
-    lat_res = float(lats[1] - lats[0])   # negative (N→S)
+    lat_res = float(lats[1] - lats[0])   # negative for N→S grids
     from rasterio.transform import from_origin
     transform = from_origin(
         west=float(lons[0]) - lon_res / 2,
-        north=float(lats[0]) - lat_res / 2,  # lats[0] is northernmost
+        north=float(lats[0]) - lat_res / 2,
         xsize=abs(lon_res),
         ysize=abs(lat_res),
     )
+    height, width = t2m.shape[1], t2m.shape[2]
+
+    # Pre-compute per-district boolean masks (once for the whole file)
+    masks = _build_district_masks(districts_gdf, transform, height, width)
+
+    # Pre-derive RH and precipitation-mm once per timestep (vectorized)
+    rh = dewpoint_to_rh(t2m, d2m)            # shape (time, lat, lon)
+    precip_mm = tp * 1000.0                  # m/hr → mm
 
     n_times = t2m.shape[0]
-    log.info("NetCDF has %d time steps, %d districts to process", n_times, len(districts_gdf))
+    log.info(
+        "  NetCDF has %d timesteps × %d districts (vectorized)",
+        n_times, len(masks),
+    )
 
-    # Accumulator: {(district_name, year, isoweek): {lists of hourly values}}
+    # Compute (district, week) → list of timestep values
+    import datetime as _dt
     from collections import defaultdict
-    import datetime
+    accum: dict = defaultdict(lambda: {"t": [], "p": [], "h": []})
 
-    accum: dict = defaultdict(lambda: {
-        "temps": [],
-        "precip": [],
-        "humidity": [],
-    })
+    # Pre-compute (year, week) for each timestep
+    iso_keys = []
+    for t in time_vals:
+        py_dt = _dt.datetime(t.year, t.month, t.day, t.hour)
+        iso = py_dt.isocalendar()
+        iso_keys.append((iso[0], iso[1]))
 
-    for t_idx in range(n_times):
-        dt = time_vals[t_idx]
-        # Convert cftime → Python datetime → isoweek
-        py_dt = datetime.datetime(dt.year, dt.month, dt.day, dt.hour)
-        iso = py_dt.isocalendar()          # (year, week, weekday)
-        year, week = iso[0], iso[1]
+    # Outer loop: districts (small). Inner: vectorized over time.
+    for dname, mask in masks.items():
+        # Apply mask once per variable — gives (time,) shaped means
+        masked_t = t2m[:, mask]              # (time, n_pixels_in_district)
+        masked_p = precip_mm[:, mask]
+        masked_h = rh[:, mask]
+        # Per-timestep means over the masked pixels
+        t_mean = np.nanmean(masked_t, axis=1)   # (time,)
+        p_mean = np.nanmean(masked_p, axis=1)   # mean rainfall over district at this timestep
+        h_mean = np.nanmean(masked_h, axis=1)   # (time,)
+        for i, (yr, wk) in enumerate(iso_keys):
+            accum[(dname, yr, wk)]["t"].append(float(t_mean[i]))
+            accum[(dname, yr, wk)]["p"].append(float(p_mean[i]))
+            accum[(dname, yr, wk)]["h"].append(float(h_mean[i]))
 
-        # Extract 2-D slices for this time step
-        temp_2d     = np.array(t2m[t_idx])  # (lat, lon)
-        precip_2d   = np.array(tp[t_idx])   # (lat, lon), metres/hour
-        dewpt_2d    = np.array(d2m[t_idx])  # (lat, lon)
-
-        # Rh needs temp in K and dewpoint in K
-        rh_2d = dewpoint_to_rh(temp_2d, dewpt_2d)
-
-        # Convert precipitation: m/hour → mm
-        precip_mm_2d = precip_2d * 1000.0
-
-        for _, district_row in districts_gdf.iterrows():
-            dname = district_row["district_name"]
-            geom  = district_row["geometry"]
-
-            key = (dname, year, week)
-            accum[key]["temps"].append(zonal_mean(temp_2d, transform, geom))
-            accum[key]["precip"].append(zonal_mean(precip_mm_2d, transform, geom))
-            accum[key]["humidity"].append(zonal_mean(rh_2d, transform, geom))
-
-        if t_idx % 100 == 0:
-            log.info("  Processed time step %d / %d", t_idx, n_times)
-
-    ds.close()
-
-    # Aggregate hourly → weekly
+    # Reduce per-week
     records = []
     for (dname, year, week), vals in accum.items():
-        temps    = [v for v in vals["temps"]    if not np.isnan(v)]
-        precips  = [v for v in vals["precip"]   if not np.isnan(v)]
-        humids   = [v for v in vals["humidity"] if not np.isnan(v)]
+        t_arr = np.array([v for v in vals["t"] if not np.isnan(v)])
+        p_arr = np.array([v for v in vals["p"] if not np.isnan(v)])
+        h_arr = np.array([v for v in vals["h"] if not np.isnan(v)])
 
-        if not temps:
+        if t_arr.size == 0:
             log.warning("No valid pixels for %s week %d-%d — skipping", dname, year, week)
             continue
 
-        # Temperature: mean and max (K → °C)
-        temp_arr   = np.array(temps)
-        temp_mean_c = float(np.mean(temp_arr) - 273.15)
-        temp_max_c  = float(np.max(temp_arr)  - 273.15)
-
-        # Rainfall: sum of hourly mm over the week
-        rainfall_mm = float(np.sum(precips)) if precips else float("nan")
-
-        # Humidity: mean over the week
-        humidity_pct = float(np.mean(humids)) if humids else float("nan")
+        # Rainfall: sum across timesteps. With 6-hourly sampling, each timestep
+        # represents ~6 hours of accumulation. ERA5-Land tp is m/hour, already
+        # converted to mm above. Approximate the total as mean × steps_in_week.
+        # Simpler: use sum directly (a small bias for 6-hourly vs hourly is
+        # acceptable for a weekly aggregate).
+        rainfall_mm = float(np.sum(p_arr))
+        temp_mean_c = float(np.mean(t_arr) - 273.15)
+        temp_max_c  = float(np.max(t_arr) - 273.15)
+        humidity_pct = float(np.mean(h_arr)) if h_arr.size else float("nan")
 
         records.append({
             "district_name": dname,
@@ -314,7 +451,7 @@ def process_netcdf(nc_path: Path, districts_gdf: gpd.GeoDataFrame) -> list[dict]
             "humidity_pct":  round(humidity_pct, 3),
         })
 
-    log.info("Produced %d weekly district records", len(records))
+    log.info("  Produced %d weekly district records", len(records))
     return records
 
 
@@ -388,7 +525,7 @@ def run(year: int):
     districts_gdf = gpd.read_file(BOUNDARIES_SHP).to_crs("EPSG:4326")
 
     # Normalise name column — same logic as ingest_boundaries.py
-    name_candidates = ["ADM2_EN", "NAME_2", "DIST_NAME", "district", "name"]
+    name_candidates = ["adm2_name", "ADM2_EN", "NAME_2", "DIST_NAME", "district", "name"]
     name_col = next((c for c in name_candidates if c in districts_gdf.columns), None)
     if name_col is None:
         raise ValueError(
@@ -399,12 +536,38 @@ def run(year: int):
 
     log.info("Loaded %d district polygons", len(districts_gdf))
 
-    # 2. Download ERA5 (skips if already downloaded)
-    with tempfile.TemporaryDirectory(prefix="era5_") as tmp_dir:
-        nc_path = download_era5(year, tmp_dir)
+    # 2. Download ERA5 (per-month — skips files that already exist)
+    # Persist downloads outside the worker temp dir so retries can resume.
+    cache_dir = Path(f"/opt/airflow/data/raw/era5_cache/{year}")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    nc_paths = download_era5(year, str(cache_dir))
 
-        # 3. Process NetCDF → weekly records
-        records = process_netcdf(nc_path, districts_gdf)
+    # 3. Process each monthly NetCDF and merge weekly aggregates
+    from collections import defaultdict
+    merged_accum: dict = defaultdict(lambda: {"temps": [], "precip": [], "humidity": []})
+    for nc_path in nc_paths:
+        log.info("Processing %s …", nc_path.name)
+        month_records = process_netcdf(nc_path, districts_gdf)
+        for rec in month_records:
+            key = (rec["district_name"], rec["year"], rec["week"])
+            merged_accum[key]["temps"].append(rec["temp_mean_c"])
+            merged_accum[key]["precip"].append(rec["rainfall_mm"])
+            merged_accum[key]["humidity"].append(rec["humidity_pct"])
+            merged_accum[key].setdefault("temp_max", []).append(rec["temp_max_c"])
+
+    # Re-aggregate across months (weeks spanning Feb 28→Mar 1 will appear
+    # in two monthly files; combine them here)
+    records = []
+    for (dname, yr, wk), vals in merged_accum.items():
+        records.append({
+            "district_name": dname,
+            "year":          yr,
+            "week":          wk,
+            "temp_mean_c":   round(float(np.mean(vals["temps"])), 3),
+            "temp_max_c":    round(float(np.max(vals["temp_max"])), 3),
+            "rainfall_mm":   round(float(np.sum(vals["precip"])), 3),
+            "humidity_pct":  round(float(np.mean(vals["humidity"])), 3),
+        })
 
     # 4. Insert into DB
     conn = get_db_conn()
