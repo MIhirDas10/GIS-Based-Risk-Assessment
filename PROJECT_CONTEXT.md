@@ -171,6 +171,8 @@ This is why `features.forecast_mart` was created (weather-only join, last-year s
 
 Location: `new dataset/`
 
+> ⚠️ **Not in version control.** These workbooks are large binaries and are gitignored, so a fresh clone will not contain them. Copy the folder in manually before running any extraction. Source: DGHS daily situation reports.
+
 ### 5.1 Structure
 
 ```

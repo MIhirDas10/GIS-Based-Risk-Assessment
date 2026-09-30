@@ -52,6 +52,11 @@ pip-wheel-metadata/
 /mlflow/mlruns/
 /mlflow-artifacts/
 
+# Source datasets are kept out of version control: the DGHS workbooks are
+# large binaries, and Git handles them poorly. Obtain them separately and
+# place them under "new dataset/" as described in PROJECT_CONTEXT.md.
+/new dataset/
+
 # DVC local cache
 /.dvc/cache/
 /.dvc/tmp/
