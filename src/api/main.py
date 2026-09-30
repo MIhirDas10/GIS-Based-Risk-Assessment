@@ -26,13 +26,14 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-import mlflow
 import pandas as pd
 import redis
 from fastapi import FastAPI, HTTPException
 from fastapi import Path as PathParam
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
+
+import mlflow
 
 # Make the shared db helpers importable regardless of which container we're
 # running in. Both paths are no-ops if the dir doesn't exist.
