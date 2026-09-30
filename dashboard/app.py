@@ -37,7 +37,7 @@ CSS = """
 /* Main App Reset */
 .stApp {
     background-color: #F7F6F3 !important;
-    background-image: 
+    background-image:
         radial-gradient(at 0% 0%, rgba(240, 237, 230, 0.6) 0, transparent 50%),
         radial-gradient(at 100% 0%, rgba(217, 167, 82, 0.05) 0, transparent 50%) !important;
     color: #2D3139 !important;
@@ -458,23 +458,23 @@ def history_figure(history: list[dict[str, Any]]) -> go.Figure:
     if df.empty:
         fig.update_layout(**CHART_LAYOUT, height=280, margin=dict(l=15, r=15, t=15, b=15))
         return fig
-    
+
     df["label"] = df["year"].astype(str) + "-W" + df["week"].astype(int).astype(str).str.zfill(2)
-    
+
     # Elegant area curve for cases
     fig.add_trace(go.Scatter(
         x=df["label"], y=df["dengue_cases"], mode="lines", name="Cases",
         line=dict(color="#C94A4A", width=2, shape="spline"),
         fill="tozeroy", fillcolor="rgba(201, 74, 74, 0.05)",
     ), secondary_y=False)
-    
+
     # Classically designed bars for rainfall
     if "rainfall_mm" in df:
         fig.add_trace(go.Bar(
             x=df["label"], y=df["rainfall_mm"], name="Rainfall",
             marker=dict(color="rgba(72, 140, 111, 0.15)", line=dict(color="rgba(72, 140, 111, 0.3)", width=0.5)),
         ), secondary_y=True)
-        
+
     fig.update_layout(
         **CHART_LAYOUT, height=280, hovermode="x unified",
         margin=dict(l=15, r=15, t=15, b=15),
@@ -493,21 +493,21 @@ def model_charts(metrics: dict[str, Any]) -> go.Figure:
         subplot_titles=("Predictive Error Metrics", "Model Performance Scores"),
         horizontal_spacing=0.15
     )
-    
+
     fig.add_trace(go.Bar(
         x=["RMSE", "MAE"], y=[metrics.get("rmse", 0), metrics.get("mae", 0)],
         marker=dict(color=["#8C8269", "#C5A880"], line_width=0),
         text=[format_number(metrics.get("rmse"), 0), format_number(metrics.get("mae"), 0)],
         textposition="outside", textfont=dict(color="#2D3139", size=10),
     ), row=1, col=1)
-    
+
     fig.add_trace(go.Bar(
         x=["R² Metric", "Outbreak F1"], y=[metrics.get("r2", 0), metrics.get("outbreak_f1", 0)],
         marker=dict(color=["#A3B899", "#C94A4A"], line_width=0),
         text=[format_number(metrics.get("r2"), 3), format_number(metrics.get("outbreak_f1"), 3)],
         textposition="outside", textfont=dict(color="#2D3139", size=10),
     ), row=1, col=2)
-    
+
     fig.update_layout(
         **CHART_LAYOUT, height=270, margin=dict(l=10, r=10, t=35, b=10), showlegend=False,
     )
@@ -572,7 +572,7 @@ def render_header(health: dict[str, Any] | None) -> None:
         pills_html = "".join(pills)
     else:
         pills_html = '<span class="editorial-pill"><span class="status-dot inactive"></span>Surveillance API: Down</span>'
-        
+
     hdr_html = (
         f'<div class="header-container">'
         f'<div class="title-area">'
@@ -653,7 +653,7 @@ def render_district_tab(districts):
         return
     lookup = {f"{d['district_name']} ({d['division_name']})": d for d in districts}
     default = next((k for k in lookup if k.startswith("Dhaka ")), sorted(lookup)[0])
-    
+
     # Spacious search layout
     sel = st.selectbox("Geographical Query Selector", sorted(lookup), index=sorted(lookup).index(default))
     detail, err = safe_api_get(f"/district/{lookup[sel]['district_id']}")
