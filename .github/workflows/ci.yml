@@ -7,22 +7,43 @@ on:
     branches: ["main"]
 
 jobs:
-  lint-and-test:
+  lint:
+    name: Lint (ruff)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
-          python-version: "3.10"
+          python-version: "3.11"
+
+      # Pinned deliberately: an unpinned ruff silently gains new default rules
+      # on release and turns a green build red without any code change.
+      - name: Install ruff
+        run: pip install ruff==0.16.9
+
+      # Rule selection and per-file exemptions live in pyproject.toml.
+      - name: Lint
+        run: ruff check src/ dashboard/ tests/ scripts/
+
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
 
       - name: Install dependencies
         run: |
-          pip install ruff pytest
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: Lint with ruff
-        run: ruff check src/ dashboard/ tests/ --ignore E501
-
-      - name: Run tests
-        run: pytest tests/ -v --tb=short
+      # Integration tests (database, Redis, MLflow, API) are excluded here:
+      # they need the Docker stack and a populated database. Run them locally
+      # with: pytest tests/ -v
+      - name: Run unit tests
+        run: pytest tests/ -v --tb=short -m "not integration"

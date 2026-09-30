@@ -48,7 +48,6 @@ import matplotlib
 
 matplotlib.use("Agg")  # non-interactive backend for servers
 import matplotlib.pyplot as plt
-import mlflow
 import mlflow.sklearn
 import mlflow.xgboost
 import numpy as np
@@ -63,6 +62,7 @@ from sklearn.metrics import (
 )
 from sklearn.preprocessing import StandardScaler
 
+import mlflow
 from db import get_sqlalchemy_engine  # noqa: E402
 
 warnings.filterwarnings("ignore", category=FutureWarning)

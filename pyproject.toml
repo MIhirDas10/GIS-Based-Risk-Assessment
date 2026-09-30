@@ -21,6 +21,10 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["E402"]   # late imports allowed in test files
 "scripts/*" = ["E402"]
+# Plotly and Folium take their layout/style config as keyword arguments, and
+# dict(...) is the idiomatic form throughout their own documentation. Rewriting
+# these as literals hurts readability without buying anything.
+"dashboard/*" = ["C408"]
 
 
 [tool.pytest.ini_options]
