@@ -79,3 +79,6 @@ pip-wheel-metadata/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Generated dashboard screenshots
+/data/dashboard_screenshots/
