@@ -12,11 +12,26 @@ x-airflow-common: &airflow-common
     AIRFLOW__WEBSERVER__SECRET_KEY: "dengue-secret-2024"
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
     PYTHONPATH: /opt/airflow/src
+    # Make the project scripts (ingest_*, build_features, train, predict) reach
+    # the right peer containers when run from Airflow tasks. Without these,
+    # get_db_conn() defaults to 'localhost' which inside the container points
+    # to itself, not postgres.
+    POSTGRES_HOST: postgres
+    POSTGRES_PORT: "5432"
+    POSTGRES_DB: dengue_db
+    POSTGRES_USER: dengue_admin
+    POSTGRES_PASSWORD: dengue_pass_2024
+    REDIS_HOST: redis
+    REDIS_PORT: "6379"
+    MLFLOW_TRACKING_URI: http://mlflow:5000
   volumes:
     - ./airflow/dags:/opt/airflow/dags
     - ./src:/opt/airflow/src
     - ./data:/opt/airflow/data
+    - ./tests:/opt/airflow/tests          # so pytest sees host-side edits
+    - ./pyproject.toml:/opt/airflow/pyproject.toml:ro   # ruff config
     - airflow-logs:/opt/airflow/logs
+    - ./.cdsapirc:/home/airflow/.cdsapirc:ro
   depends_on:
     postgres:
       condition: service_healthy
@@ -28,6 +43,7 @@ services:
   postgres:
     image: postgis/postgis:15-3.4
     container_name: dengue_postgres
+    restart: always   # auto-recover after host reboot / power cut
     environment:
       POSTGRES_USER: dengue_admin
       POSTGRES_PASSWORD: dengue_pass_2024
@@ -48,6 +64,7 @@ services:
   redis:
     image: redis:7.2-alpine
     container_name: dengue_redis
+    restart: always
     ports:
       - "6379:6379"
     healthcheck:
@@ -61,9 +78,10 @@ services:
   mlflow:
     image: python:3.11-slim
     container_name: dengue_mlflow
-    command: bash -c "pip install mlflow==2.10.2 psycopg2-binary==2.9.9 --quiet && mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri postgresql+psycopg2://dengue_admin:dengue_pass_2024@postgres:5432/mlflow_db --default-artifact-root /mlflow/artifacts"
+    restart: always
+    command: bash -c "pip install mlflow==2.10.2 psycopg2-binary==2.9.9 --quiet && mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri postgresql+psycopg2://dengue_admin:dengue_pass_2024@postgres:5432/mlflow_db --artifacts-destination /mlflow/artifacts --serve-artifacts"
     ports:
-      - "5000:5000"
+      - "5001:5000"   # host 5001 -> container 5000 (host 5000 is taken by another process on this machine)
     volumes:
       - mlflow-artifacts:/mlflow/artifacts
     depends_on:
@@ -107,19 +125,36 @@ services:
       context: .
       dockerfile: Dockerfile.api
     container_name: dengue_api
+    restart: always
     ports:
       - "8000:8000"
     environment:
       POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: dengue_db
+      POSTGRES_USER: dengue_admin
+      POSTGRES_PASSWORD: dengue_pass_2024
       REDIS_HOST: redis
+      REDIS_PORT: "6379"
       MLFLOW_TRACKING_URI: http://mlflow:5000
+      PREDICTION_OUTPUT_DIR: /opt/airflow/data/processed
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5).read()"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
     volumes:
-      - ./src/api:/app
+      # Mount whole src/ so `from db import ...` resolves; also mount the
+      # data dir so the cold-start GeoJSON fallback can find files written
+      # by the airflow container's predict.py.
+      - ./src:/app:ro
+      - ./data:/opt/airflow/data:ro
     networks:
       - dengue-net
 
@@ -129,12 +164,20 @@ services:
       context: .
       dockerfile: Dockerfile.dashboard
     container_name: dengue_dashboard
+    restart: always
     ports:
       - "8501:8501"
     environment:
       API_URL: http://api:8000
     depends_on:
-      - api
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health', timeout=5).read()"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
     volumes:
       - ./dashboard:/app
     networks:
