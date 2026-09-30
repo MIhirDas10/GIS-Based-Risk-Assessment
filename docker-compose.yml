@@ -1,7 +1,10 @@
 # version: "3.8"
 
 x-airflow-common: &airflow-common
-  image: apache/airflow:2.8.1-python3.11
+  build:
+    context: .
+    dockerfile: Dockerfile.airflow
+  image: dengue-airflow:latest
   environment:
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://dengue_admin:dengue_pass_2024@postgres:5432/dengue_db
