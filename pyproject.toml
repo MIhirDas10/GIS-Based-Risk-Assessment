@@ -18,6 +18,13 @@ ignore = [
     "B008",   # function calls in argument defaults (pytest fixtures use this)
 ]
 
+[tool.ruff.lint.isort]
+# These are imported as top-level modules because src/ is on PYTHONPATH inside
+# the containers. Without stating it, ruff infers first-party status from the
+# working directory, so the same file sorts differently when linted from the
+# repo root versus elsewhere, and the "fix" oscillates between two states.
+known-first-party = ["db", "api", "ingestion", "features", "models", "dashboard"]
+
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["E402"]   # late imports allowed in test files
 "scripts/*" = ["E402"]
